@@ -1,0 +1,6 @@
+body { margin: 0; background: #f5f7fa; font-family: "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif; }
+.page { padding: 16px; }
+.card-gap { margin-bottom: 16px; }
+.muted { color: #909399; font-size: 12px; }
+.danmaku-list { height: 300px; overflow-y: auto; border: 1px solid #ebeef5; border-radius: 6px; padding: 8px; background: #fff; }
+.danmaku-list > div { padding: 3px 0; border-bottom: 1px dashed #f0f0f0; }
