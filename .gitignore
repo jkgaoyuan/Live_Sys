@@ -6,6 +6,9 @@ dist/
 .env
 # 流媒体产物（SRS DVR 原片 + 回放 HLS），体积大且可由重新生成回放复原
 backend/storage/media/
+# 运行时上传的图片与临时生成素材
+backend/storage/uploads/
+vibe_images/
 *.log
 .admin_tok
 .pushkey
