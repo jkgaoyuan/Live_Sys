@@ -1,26 +1,35 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
 from .database import engine, SessionLocal
 from .models import Base, User
-from .deps import hash_password, ok
+from .deps import hash_password, ok, UPLOAD_DIR
+from . import media, recording
 from .routers import auth, courses, live, assess, stats
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(engine)
+    with engine.begin() as conn:  # 项目未引入迁移框架，旧库补列
+        conn.execute(text(
+            "ALTER TABLE recordings ADD COLUMN IF NOT EXISTS error_message VARCHAR(256)"))
     db = SessionLocal()
     if not db.query(User).filter(User.username == "admin").first():
         db.add(User(username="admin", password_hash=hash_password("admin123"),
                     real_name="平台管理员", role="admin"))
         db.commit()
     db.close()
+    recording.start_worker()
     yield
 
 
@@ -33,6 +42,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.mount("/static", StaticFiles(directory=str(UPLOAD_DIR.parent)), name="static")
 
 for r in (auth, courses, live, assess, stats):
     app.include_router(r.router, prefix="/api/v1")

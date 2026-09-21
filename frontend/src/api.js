@@ -1,7 +1,8 @@
 import axios from 'axios'
 import { auth } from './store'
 
-export const http = axios.create({ baseURL: 'http://127.0.0.1:8000/api/v1', timeout: 15000 })
+export const API_ORIGIN = 'http://127.0.0.1:8000'
+export const http = axios.create({ baseURL: `${API_ORIGIN}/api/v1`, timeout: 15000 })
 
 http.interceptors.request.use((c) => {
   if (auth.token) c.headers.Authorization = `Bearer ${auth.token}`

@@ -2,7 +2,9 @@
 """Live_Sys 端到端业务流程模拟：按 PRD 主链路真实调用 REST API（PostgreSQL）。"""
 import io
 import os
+import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend"))
@@ -11,6 +13,7 @@ from fastapi.testclient import TestClient
 from openpyxl import load_workbook
 
 from app.main import app
+from app import media
 from app.database import engine
 from app.models import Base
 
@@ -50,6 +53,27 @@ def login(client, username, password="Test@123"):
 
 def utc(minute_offset=0):
     return (datetime.utcnow() + timedelta(minutes=minute_offset)).isoformat()
+
+
+def start_rtmp_push(stream_key, seconds=20):
+    """ffmpeg 合成真实音视频推入 SRS（等价于浏览器 WHIP 推流的传输层验证）。"""
+    cmd = [media.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-re",
+           "-f", "lavfi", "-i", f"testsrc2=size=640x360:rate=25:duration={seconds}",
+           "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
+           "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+           "-g", "50", "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "44100",
+           "-f", "flv", f"rtmp://{media.SRS_PUBLIC_HOST}:1935/live/{stream_key}"]
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def wait_recording(client, sid, token, timeout=180):
+    """停播后轮询服务端自动转码结果，全程无人工回调。"""
+    deadline = time.time() + timeout
+    while True:
+        rec = api(client, "get", f"/schedules/{sid}/recording", token=token)
+        if rec["status"] != "transcoding" or time.time() > deadline:
+            return rec
+        time.sleep(3)
 
 
 def main():
@@ -158,8 +182,18 @@ def run(client):
     # ---------- 阶段4：直播 + 互动 ----------
     print("\n[阶段4] 直播授课与互动")
     room = api(client, "post", f"/schedules/{sched['id']}/start", token=t1)
-    MEASURED["推流地址(SRS占位)"] = room["push_url"]
     check("开播生成直播间", room["status"] == "living")
+    check("开播返回 SRS WHIP 真实推流地址", room["push_url"].endswith(room["stream_key"]))
+    srs_up = media.media_reachable()
+    check("流媒体服务(SRS)在线", srs_up, "未在线，请先 docker compose up -d srs")
+    push = start_rtmp_push(room["stream_key"], 20) if srs_up else None
+    if push:
+        time.sleep(8)
+        check("SRS 已收到该直播流", room["stream_key"] in (media.publishing_streams() or set()))
+        check("服务端自动录制中(DVR 原片落盘)",
+              any(media.DVR_DIR.glob(f"{room['stream_key']}.*")))
+        check("直播中 HLS 切片已产出", any((media.MEDIA_DIR / "live").glob(f"{room['stream_key']}*.ts")))
+        MEASURED["推流与录制"] = f"{room['push_url']} -> DVR {room['stream_key']}.*.mp4"
 
     api(client, "post", f"/rooms/{room['room_id']}/messages", token=s1,
         json={"type": "danmaku", "content": "老师好"})
@@ -211,6 +245,8 @@ def run(client):
           expect_status(client, "post", f"/rooms/{room['room_id']}/heartbeat", s1, 422,
                         json={"seconds": 90}) == 422)
 
+    if push:
+        push.wait(timeout=60)          # 讲师停推流，SRS 随即定稿录制原片
     stopped = api(client, "post", f"/rooms/{room['room_id']}/stop", token=t1)
     check("停播自动生成录制任务", stopped["recording_status"] == "transcoding")
     check("停播后心跳被拒(409)",
@@ -228,14 +264,28 @@ def run(client):
 
     # ---------- 阶段5：录播回放 ----------
     print("\n[阶段5] 课程录播与回放")
-    api(client, "post", f"/recordings/{stopped['recording_id']}/transcode", token=t1, json={"duration": 3600})
-    rec = api(client, "get", f"/schedules/{sched['id']}/recording", token=s3)
-    check("转码完成 HLS 就绪", rec["status"] == "ready" and rec["hls_url"])
-    api(client, "put", f"/recordings/{rec['id']}/heartbeat", token=s3, json={"seconds": 30, "position": 900})
+    rec = wait_recording(client, sched["id"], t1)
+    check("停播后自动转码出可播回放", rec["status"] == "ready", rec.get("error_message") or "")
+    check("回放时长来自真实录制", (rec["duration"] or 0) >= 10, f"duration={rec['duration']}")
+    check("HLS 切片文件已真实产出", (media.REPLAY_DIR / f"rec_{rec['id']}" / "index.m3u8").exists())
+    m3u = api(client, "get", f"/recordings/{rec['id']}/hls/index.m3u8", token=s3)
+    check("已选课学生可取回放 m3u8", "#EXTM3U" in m3u.text)
+    seg = [l for l in m3u.text.splitlines() if l.endswith(".ts")][0]
+    check("回放切片可取", api(client, "get", f"/recordings/{rec['id']}/hls/{seg}", token=s3).status_code == 200)
+    check("未选课学生取回放被拒(403)",
+          expect_status(client, "get", f"/recordings/{rec['id']}/hls/index.m3u8", s_out, 403) == 403)
+    dl = client.get(BASE + f"/recordings/{rec['id']}/download",
+                    headers={"Authorization": f"Bearer {admin}"})
+    check("管理员可下载录制原片", dl.status_code == 200 and len(dl.content) > 100000,
+          f"{dl.status_code} {len(dl.content)}B")
+    check("非管理员下载被拒(403)",
+          expect_status(client, "get", f"/recordings/{rec['id']}/download", t1, 403) == 403)
+    p1, p2 = 5, 10
+    api(client, "put", f"/recordings/{rec['id']}/heartbeat", token=s3, json={"seconds": 30, "position": p1})
     rp = api(client, "put", f"/recordings/{rec['id']}/heartbeat", token=s3,
-             json={"seconds": 30, "position": 1800})
+             json={"seconds": 30, "position": p2})
     MEASURED["学生3回放"] = f"{rp['total_seconds']}s 断点{rp['last_position']}s"
-    check("回放累计时长+断点续播", rp["total_seconds"] == 60 and rp["last_position"] == 1800)
+    check("回放累计时长+断点续播", rp["total_seconds"] == 60 and rp["last_position"] == p2)
     check("未选课学生拉回放被拒(403)",
           expect_status(client, "put", f"/recordings/{rec['id']}/heartbeat", s_out, 403,
                         json={"seconds": 30}) == 403)

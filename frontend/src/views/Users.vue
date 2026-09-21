@@ -1,7 +1,7 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { http, err } from '../api'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { ROLE_NAME } from '../store'
 
 const users = ref([]); const classes = ref([])
@@ -21,8 +21,29 @@ async function addUser() {
   } catch (e) { ElMessage.error(err(e)) }
 }
 async function addClass() {
-  try { await http.post('/classes', cForm.value); ElMessage.success('班级已创建'); cForm.value.name = ''; load() }
+  const name = cForm.value.name.trim()
+  if (!name) return ElMessage.warning('请填写班级名称')
+  if (name.length > 10) return ElMessage.warning('班级名称不能超过 10 个中文字符')
+  try { await http.post('/classes', { ...cForm.value, name }); ElMessage.success('班级已创建'); cForm.value.name = ''; load() }
   catch (e) { ElMessage.error(err(e)) }
+}
+async function delClass(c) {
+  try {
+    await ElMessageBox.confirm(`确定删除班级「${c.name}」？`, '删除班级', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' })
+  } catch { return }
+  try { await http.delete(`/classes/${c.id}`); ElMessage.success('班级已删除'); load() }
+  catch (e) { ElMessage.error(err(e)) }
+}
+async function toggleUser(u) {
+  const disabling = u.status === 'active'
+  const word = disabling ? '删除（禁用）' : '启用'
+  try {
+    await ElMessageBox.confirm(`确定${word}账号「${u.real_name} @${u.username}」？${disabling ? '该用户将无法登录。' : ''}`, `${word}用户`, { type: 'warning', confirmButtonText: word, cancelButtonText: '取消' })
+  } catch { return }
+  try {
+    await http.patch(`/users/${u.id}/status`, { status: disabling ? 'disabled' : 'active' })
+    ElMessage.success(disabling ? '用户已删除（禁用）' : '用户已启用'); load()
+  } catch (e) { ElMessage.error(err(e)) }
 }
 </script>
 
@@ -38,7 +59,14 @@ async function addClass() {
             <el-table-column prop="real_name" label="姓名" width="110" />
             <el-table-column label="角色" width="100"><template #default="s"><el-tag size="small">{{ ROLE_NAME[s.row.role] }}</el-tag></template></el-table-column>
             <el-table-column prop="class_id" label="班级ID" width="80" />
-            <el-table-column prop="status" label="状态" width="80" />
+            <el-table-column label="状态" width="80"><template #default="s"><el-tag size="small" :type="s.row.status === 'active' ? 'success' : 'info'">{{ s.row.status === 'active' ? '正常' : '已禁用' }}</el-tag></template></el-table-column>
+            <el-table-column label="操作" width="90">
+              <template #default="s">
+                <el-button v-if="s.row.role !== 'admin'" size="small" :type="s.row.status === 'active' ? 'danger' : 'success'" text @click="toggleUser(s.row)">
+                  {{ s.row.status === 'active' ? '删除' : '启用' }}
+                </el-button>
+              </template>
+            </el-table-column>
           </el-table>
         </el-card>
       </el-col>
@@ -59,13 +87,16 @@ async function addClass() {
         <el-card>
           <template #header>班级</template>
           <div style="display:flex;gap:8px;margin-bottom:10px">
-            <el-input v-model="cForm.name" size="small" placeholder="班级名" />
+            <el-input v-model="cForm.name" size="small" placeholder="班级名" maxlength="10" show-word-limit />
             <el-button size="small" type="primary" @click="addClass">新建</el-button>
           </div>
           <el-table :data="classes" size="small">
             <el-table-column prop="id" label="#" width="46" />
             <el-table-column prop="name" label="班级" />
             <el-table-column prop="head_teacher_id" label="班主任ID" width="90" />
+            <el-table-column label="操作" width="70">
+              <template #default="s"><el-button size="small" type="danger" text @click="delClass(s.row)">删除</el-button></template>
+            </el-table-column>
           </el-table>
         </el-card>
       </el-col>

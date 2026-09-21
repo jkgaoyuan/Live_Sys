@@ -2,7 +2,7 @@
 import { ref, onMounted, computed } from 'vue'
 import { http, err } from '../api'
 import { auth } from '../store'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 const role = computed(() => auth.user.role)
 // 学生
@@ -13,6 +13,7 @@ const result = ref(null)
 const exams = ref([]); const courses = ref([])
 const bank = ref([]); const bankCourse = ref(null)
 const showQ = ref(false); const qForm = ref({ type: 'single', stem: '', options: '选项A\n选项B\n选项C\n选项D', answer: '0', score: 10 })
+const editing = ref(null)
 const showE = ref(false)
 const eForm = ref({ course_id: null, chapter_id: null, title: '', question_ids: [], duration: 45, pass_score: 30, range: [] })
 const chapters = ref([])
@@ -53,13 +54,35 @@ async function submitPaper() {
 // ---------- 讲师 ----------
 async function pickBank(id) { bankCourse.value = id; bank.value = await http.get(`/courses/${id}/questions`) }
 async function addQ() {
+  const opts = qForm.value.type === 'single' || qForm.value.type === 'multiple'
+    ? qForm.value.options.split('\n').filter(Boolean) : []
+  const payload = { course_id: bankCourse.value, type: qForm.value.type, stem: qForm.value.stem,
+    options: opts, answer: qForm.value.answer, score: qForm.value.score }
   try {
-    const opts = qForm.value.type === 'single' || qForm.value.type === 'multiple'
-      ? qForm.value.options.split('\n').filter(Boolean) : []
-    await http.post('/questions', { course_id: bankCourse.value, type: qForm.value.type, stem: qForm.value.stem,
-      options: opts, answer: qForm.value.answer, score: qForm.value.score })
-    ElMessage.success('已入库'); showQ.value = false; pickBank(bankCourse.value)
+    if (editing.value) await http.put(`/questions/${editing.value}`, payload)
+    else await http.post('/questions', payload)
+    ElMessage.success(editing.value ? '题目已更新' : '已入库'); showQ.value = false; editing.value = null; pickBank(bankCourse.value)
   } catch (e) { ElMessage.error(err(e)) }
+}
+
+function openAddQ() {
+  editing.value = null
+  qForm.value = { type: 'single', stem: '', options: '选项A\n选项B\n选项C\n选项D', answer: '0', score: 10 }
+  showQ.value = true
+}
+
+function openEditQ(q) {
+  editing.value = q.id
+  qForm.value = { type: q.type, stem: q.stem, options: (q.options || []).join('\n'), answer: q.answer, score: q.score }
+  showQ.value = true
+}
+
+async function deleteQ(q) {
+  try {
+    await ElMessageBox.confirm(`确认删除题目 #${q.id}？`, '删除题目', { type: 'warning' })
+  } catch { return }
+  try { await http.delete(`/questions/${q.id}`); ElMessage.success('题目已删除'); pickBank(bankCourse.value) }
+  catch (e) { ElMessage.error(err(e)) }
 }
 
 async function pickECourse(id) {
@@ -131,7 +154,7 @@ async function gradeAttempt(a) {
             <span>
               <el-select v-model="bankCourse" size="small" style="width:170px" placeholder="题库课程" @change="pickBank">
                 <el-option v-for="c in courses" :key="c.id" :label="c.title" :value="c.id" /></el-select>
-              <el-button size="small" style="margin-left:8px" :disabled="!bankCourse" @click="showQ = true">录入题目</el-button>
+              <el-button size="small" style="margin-left:8px" :disabled="!bankCourse" @click="openAddQ">录入题目</el-button>
               <el-button size="small" type="primary" style="margin-left:8px" @click="showE = true">创建考试</el-button>
             </span>
           </div>
@@ -152,6 +175,12 @@ async function gradeAttempt(a) {
           <el-table-column prop="type" label="题型" width="90" />
           <el-table-column prop="stem" label="题干" min-width="220" />
           <el-table-column prop="score" label="分值" width="60" />
+          <el-table-column label="操作" width="120">
+            <template #default="s">
+              <el-button size="small" text type="primary" @click="openEditQ(s.row)">编辑</el-button>
+              <el-button size="small" text type="danger" @click="deleteQ(s.row)">删除</el-button>
+            </template>
+          </el-table-column>
         </el-table>
       </el-card>
     </template>
@@ -174,7 +203,7 @@ async function gradeAttempt(a) {
     </el-dialog>
 
     <!-- 录题 -->
-    <el-dialog v-model="showQ" title="录入题目" width="500px">
+    <el-dialog v-model="showQ" :title="editing ? '编辑题目' : '录入题目'" width="500px">
       <el-form label-width="60px">
         <el-form-item label="题型"><el-select v-model="qForm.type" style="width:100%">
           <el-option v-for="t in ['single','multiple','judge','essay']" :key="t" :label="t" :value="t" /></el-select></el-form-item>

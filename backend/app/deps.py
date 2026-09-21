@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from jose import jwt, ExpiredSignatureError, JWTError
 from fastapi import Depends, HTTPException, Request
@@ -14,6 +15,9 @@ JWT_ALGO = "HS256"
 ACCESS_TTL = timedelta(hours=2)
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer = HTTPBearer(auto_error=False)
+
+UPLOAD_DIR = Path(__file__).resolve().parent.parent / "storage" / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def hash_password(p: str) -> str:

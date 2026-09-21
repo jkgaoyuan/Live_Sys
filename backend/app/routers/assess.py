@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -11,6 +12,7 @@ from ..deps import (
 from ..models import (
     Assignment, Submission, Question, Exam, ExamQuestion, ExamAttempt,
     AttemptAnswer, Notification, User, Enrollment, Course,
+    AssignmentQuestion, AssignmentAnswer,
 )
 
 router = APIRouter()
@@ -22,6 +24,18 @@ def notify(db: Session, user_id: int, ntype: str, title: str, content: str = "")
 
 # ---------- 作业 ----------
 
+def _aq_snapshot(aq: AssignmentQuestion) -> dict:
+    q = aq.question
+    return {"question_id": q.id, "type": q.type, "stem": q.stem, "score": q.score,
+            "options": q.options or [], "answer": q.answer}
+
+
+def _assignment_questions(db: Session, aid: int) -> list:
+    rows = (db.query(AssignmentQuestion).filter_by(assignment_id=aid)
+            .order_by(AssignmentQuestion.sort, AssignmentQuestion.id).all())
+    return [_aq_snapshot(r) for r in rows]
+
+
 @router.post("/assignments")
 def create_assignment(body: dict, user: User = Depends(require_roles("teacher")), db: Session = Depends(get_db)):
     c = chapter_course(db, body["chapter_id"])
@@ -32,10 +46,23 @@ def create_assignment(body: dict, user: User = Depends(require_roles("teacher"))
         deadline=datetime.fromisoformat(body["deadline"]),
     )
     db.add(a)
+    db.flush()
+    qids = body.get("question_ids") or []
+    seen = set()
+    for qid in qids:
+        if qid in seen:
+            continue
+        seen.add(qid)
+        q = db.get(Question, qid)
+        if q is None:
+            raise HTTPException(404, f"题目 #{qid} 不存在")
+        if q.course_id != c.id:
+            raise HTTPException(422, f"题目 #{qid} 不属于本作业所在课程")
+        db.add(AssignmentQuestion(assignment_id=a.id, question_id=qid, sort=len(seen)))
     db.commit()
     db.refresh(a)
     return ok({"id": a.id, "chapter_id": a.chapter_id, "title": a.title,
-               "deadline": a.deadline.isoformat()})
+               "deadline": a.deadline.isoformat(), "question_count": len(seen)})
 
 
 @router.get("/assignments")
@@ -48,8 +75,9 @@ def list_assignments(user: User = Depends(require_roles("teacher", "admin")), db
     for a in q.order_by(Assignment.id.desc()):
         enrolled = db.query(Enrollment).filter_by(course_id=a.chapter.course_id).count()
         submitted = {s.student_id for s in db.query(Submission).filter_by(assignment_id=a.id)}
+        qcount = db.query(func.count(AssignmentQuestion.id)).filter_by(assignment_id=a.id).scalar()
         rows.append({"id": a.id, "chapter_id": a.chapter_id, "course_id": a.chapter.course_id,
-                     "title": a.title, "deadline": a.deadline.isoformat(),
+                     "title": a.title, "deadline": a.deadline.isoformat(), "question_count": qcount,
                      "enrolled": enrolled, "submitted": len(submitted)})
     return ok(rows)
 
@@ -62,12 +90,21 @@ def my_assignments(user: User = Depends(require_roles("student")), db: Session =
     for a in db.query(Assignment).join(Chapter, Assignment.chapter_id == Chapter.id).filter(Chapter.course_id.in_(cids)):
         subs = db.query(Submission).filter_by(assignment_id=a.id, student_id=user.id).order_by(Submission.version.desc()).all()
         latest = subs[0] if subs else None
+        questions = _assignment_questions(db, a.id)
+        answered = {}
+        if latest is not None:
+            answered = {r.question_id: r.answer for r in db.query(AssignmentAnswer).filter_by(submission_id=latest.id)}
+        for q in questions:
+            q.pop("answer")
+            q["answered"] = answered.get(q["question_id"])
         rows.append({
             "id": a.id, "title": a.title, "deadline": a.deadline.isoformat(),
             "status": latest.status if latest else "none",
             "is_late": latest.is_late if latest else None,
             "score": latest.score if latest else None,
             "feedback": latest.feedback if latest else None,
+            "questions": questions,
+            "last_content": latest.content if latest else "",
         })
     return ok(rows)
 
@@ -82,18 +119,27 @@ def assignment_submissions(aid: int, user: User = Depends(require_roles("teacher
     from ..models import Chapter
     enrolled = {e.student_id for e in db.query(Enrollment).filter_by(course_id=c.id)}
     subs = db.query(Submission).filter_by(assignment_id=aid).all()
+    questions = _assignment_questions(db, aid)
     final = {}
     for s in subs:
         if s.student_id not in final or s.version > final[s.student_id].version:
             final[s.student_id] = s
-    rows = [{
-        "submission_id": s.id,
-        "student_id": sid, "real_name": db.get(User, sid).real_name,
-        "version": s.version, "is_late": s.is_late, "status": s.status,
-        "score": s.score, "submitted_at": s.submitted_at.isoformat(),
-    } for sid, s in final.items()]
+    rows = []
+    for sid, s in final.items():
+        ans = {r.question_id: r.answer for r in db.query(AssignmentAnswer).filter_by(submission_id=s.id)}
+        rows.append({
+            "submission_id": s.id,
+            "student_id": sid, "real_name": db.get(User, sid).real_name,
+            "content": s.content,
+            "version": s.version, "is_late": s.is_late, "status": s.status,
+            "score": s.score, "feedback": s.feedback,
+            "submitted_at": s.submitted_at.isoformat(),
+            "answers": [{"question_id": q["question_id"], "stem": q["stem"], "type": q["type"],
+                         "std_answer": q["answer"], "student_answer": ans.get(q["question_id"], "")}
+                        for q in questions],
+        })
     missing = [db.get(User, sid).real_name for sid in enrolled - set(final)]
-    return ok({"submitted": rows, "missing": missing})
+    return ok({"submitted": rows, "missing": missing, "questions": questions})
 
 
 @router.post("/assignments/{aid}/remind")
@@ -127,10 +173,21 @@ def submit_assignment(aid: int, body: dict, user: User = Depends(require_roles("
         files=body.get("files", []), version=versions + 1, is_late=now() > a.deadline,
     )
     db.add(s)
+    db.flush()
+    aq_ids = {r.question_id for r in db.query(AssignmentQuestion).filter_by(assignment_id=aid)}
+    saved = 0
+    if aq_ids:
+        seen_q = set()
+        for item in body.get("answers", []):
+            qid = item.get("question_id")
+            if qid in aq_ids and qid not in seen_q:
+                seen_q.add(qid)
+                db.add(AssignmentAnswer(submission_id=s.id, question_id=qid, answer=str(item.get("answer", ""))))
+                saved += 1
     db.commit()
     db.refresh(s)
     return ok({"submission_id": s.id, "version": s.version, "is_late": s.is_late,
-               "status": s.status})
+               "status": s.status, "answers_saved": saved})
 
 
 @router.put("/submissions/{sid}/grade")
@@ -159,6 +216,8 @@ def create_question(body: dict, user: User = Depends(require_roles("teacher")), 
     assert_course_owner(user, c)
     if body["type"] not in ("single", "multiple", "judge", "essay"):
         raise HTTPException(422, "invalid question type")
+    if body["type"] in ("single", "multiple") and len(body.get("options", [])) < 2:
+        raise HTTPException(422, "单选/多选题至少需要 2 个选项")
     q = Question(course_id=c.id, type=body["type"], stem=body["stem"],
                  options=body.get("options", []), answer=str(body["answer"]),
                  score=int(body.get("score", 5)))
@@ -173,7 +232,55 @@ def list_questions(cid: int, user: User = Depends(require_roles("teacher", "admi
     c = course_or_404(db, cid)
     assert_course_owner(user, c)
     rows = db.query(Question).filter_by(course_id=cid).all()
-    return ok([{"id": q.id, "type": q.type, "stem": q.stem, "score": q.score} for q in rows])
+    return ok([{"id": q.id, "type": q.type, "stem": q.stem, "score": q.score,
+                "options": q.options or [], "answer": q.answer} for q in rows])
+
+
+def _question_for_owner(qid: int, user: User, db: Session) -> Question:
+    q = db.get(Question, qid)
+    if q is None:
+        raise HTTPException(404, "题目不存在")
+    assert_course_owner(user, course_or_404(db, q.course_id))
+    return q
+
+
+@router.put("/questions/{qid}")
+def update_question(qid: int, body: dict, user: User = Depends(require_roles("teacher")), db: Session = Depends(get_db)):
+    q = _question_for_owner(qid, user, db)
+    if "type" in body:
+        if body["type"] not in ("single", "multiple", "judge", "essay"):
+            raise HTTPException(422, "invalid question type")
+        q.type = body["type"]
+    if "stem" in body:
+        stem = (body["stem"] or "").strip()
+        if not stem:
+            raise HTTPException(422, "题干不能为空")
+        q.stem = stem
+    if "options" in body:
+        q.options = body["options"] or []
+    if q.type in ("single", "multiple") and len(q.options) < 2:
+        raise HTTPException(422, "单选/多选题至少需要 2 个选项")
+    if "answer" in body:
+        q.answer = str(body["answer"])
+    if "score" in body:
+        score = int(body["score"])
+        if not 1 <= score <= 100:
+            raise HTTPException(422, "分值需为 1-100")
+        q.score = score
+    db.commit()
+    db.refresh(q)
+    return ok({"id": q.id, "type": q.type, "stem": q.stem, "score": q.score,
+               "options": q.options or [], "answer": q.answer})
+
+
+@router.delete("/questions/{qid}")
+def delete_question(qid: int, user: User = Depends(require_roles("teacher")), db: Session = Depends(get_db)):
+    q = _question_for_owner(qid, user, db)
+    if db.query(ExamQuestion).filter_by(question_id=qid).first():
+        raise HTTPException(409, "该题目已被考试引用，无法删除，请先删除相关考试")
+    db.delete(q)
+    db.commit()
+    return ok({"deleted": qid})
 
 
 @router.post("/exams")

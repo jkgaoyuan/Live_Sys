@@ -1,0 +1,25 @@
+# 在线课堂直播平台 · 流媒体服务（推流/拉流/服务端自动录制）
+#
+# 启动： docker compose up -d srs
+# 日志： docker logs -f live-sys-srs
+# 依赖： 宿主机需安装 ffmpeg（后端转码回放用），已验证 8.1.2 可用
+# 跨机访问：把 SRS_CANDIDATE 改成宿主机局域网 IP，并让后端 SRS_PUBLIC_HOST 指向同一地址
+services:
+  srs:
+    image: ossrs/srs:5
+    container_name: live-sys-srs
+    restart: unless-stopped
+    # 配置里的 $SRS_CANDIDATE / $SRS_HOOK_HOST 由 SRS 在启动时做环境变量替换
+    environment:
+      # 浏览器 ICE 连接 SRS 的地址：单机验证用 127.0.0.1，跨机访问改成宿主机局域网 IP
+      SRS_CANDIDATE: "127.0.0.1"
+    ports:
+      - "1935:1935"          # RTMP 推流
+      - "8080:8080"          # HTTP-FLV / HLS / WebRTC 信令(WHIP/WHEP)
+      - "1985:1985"          # SRS HTTP 接口（在线流/客户端查询）
+      - "8000:8000/udp"      # WebRTC 媒体端口
+    volumes:
+      - ./infra/srs.conf:/usr/local/srs/conf/srs.conf:ro
+      # 与后端共享：容器写 DVR 原片，宿主机 ffmpeg 读它并输出回放切片
+      - ./backend/storage/media:/usr/local/srs/objs/nginx/html
+    command: ./objs/srs -c conf/srs.conf

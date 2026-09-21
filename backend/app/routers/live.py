@@ -1,9 +1,13 @@
 from datetime import datetime, timedelta
+import re
+import shutil
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
+from .. import media, recording
 from ..database import get_db
 from ..deps import (
     ok, now, get_current_user, require_roles, course_or_404,
@@ -15,6 +19,26 @@ from ..models import (
 )
 
 router = APIRouter()
+
+_SEG_NAME = re.compile(r"^seg-\d{3}\.ts$")
+
+
+def _recording_or_404(db: Session, rid: int) -> Recording:
+    rec = db.get(Recording, rid)
+    if rec is None:
+        raise HTTPException(404, "recording not found")
+    return rec
+
+
+def _stream_info(room: LiveRoom) -> dict:
+    """推拉流地址由 SRS 真实提供：WHIP 推流、WHEP 拉流（信令端口已开 CORS）。"""
+    living = room.status == "living"
+    return {
+        "stream_key": room.stream_key,
+        "push_url": media.whip_url(room.stream_key) if living else "",
+        "pull_url": media.whep_url(room.stream_key) if living else "",
+        "recording_on_air": living,  # SRS DVR 对每路直播流自动录制，无需讲师操作
+    }
 
 
 def _room_schedule(db: Session, room_id: int):
@@ -82,9 +106,8 @@ def start_live(sid: int, user: User = Depends(require_roles("teacher", "admin"))
     db.refresh(room)
     return ok({
         "room_id": room.id, "schedule_id": s.id, "status": "living",
-        "push_url": f"webrtc://srs.local/live/{key}",
-        "pull_url": f"webrtc://srs.local/live/{key}",
-        "hls_backup": f"http://srs.local/live/{key}.m3u8",
+        **_stream_info(room),
+        "media_online": media.media_reachable(),
     })
 
 
@@ -98,13 +121,10 @@ def stop_live(rid: int, user: User = Depends(require_roles("teacher", "admin")),
     room.status = "ended"
     room.ended_at = now()
     s.status = "finished"
-    rec = Recording(
-        schedule_id=s.id,
-        file_path=f"/media/recordings/{s.id}_{uuid4().hex[:8]}.mp4",
-    )
-    db.add(rec)
+    rec = recording.create_recording(db, room)
     db.commit()
-    db.refresh(rec)
+    # 服务端录制原片已在 SRS 侧生成，后台任务只等断流定稿并转码
+    recording.spawn(rec.id, room.stream_key)
     return ok({"room_id": room.id, "status": "ended",
                "recording_id": rec.id, "recording_status": rec.status})
 
@@ -120,6 +140,7 @@ def room_detail(rid: int, user: User = Depends(get_current_user), db: Session = 
         "room_id": room.id, "schedule_id": s.id, "course_title": c.title,
         "status": room.status, "online_count": room.online_count,
         "started_at": room.started_at.isoformat(), "interaction_counts": counts,
+        **_stream_info(room),
     })
 
 
@@ -192,11 +213,33 @@ def hand_raise(rid: int, user: User = Depends(require_roles("student")), db: Ses
     if room.status != "living":
         raise HTTPException(409, "live not running")
     assert_enrolled(db, user, s.course_id)
+    active = (db.query(Interaction)
+              .filter_by(room_id=rid, student_id=user.id, type="handraise")
+              .filter(Interaction.status.in_(("waiting", "accepted")))
+              .order_by(Interaction.id.desc()).first())
+    if active and active.status == "waiting":
+        raise HTTPException(409, "已有举手待处理，请等待讲师操作")
+    if active and active.status == "accepted":
+        raise HTTPException(409, "正在连麦中，请先下麦")
     hr = Interaction(room_id=rid, student_id=user.id, type="handraise", status="waiting")
     db.add(hr)
     db.commit()
     db.refresh(hr)
     return ok({"id": hr.id, "student": user.real_name, "status": "waiting"})
+
+
+@router.post("/rooms/{rid}/handraises/lower")
+def lower_hand(rid: int, user: User = Depends(require_roles("student")), db: Session = Depends(get_db)):
+    room, s = _room_schedule(db, rid)
+    assert_enrolled(db, user, s.course_id)
+    hr = (db.query(Interaction)
+          .filter_by(room_id=rid, student_id=user.id, type="handraise", status="accepted")
+          .order_by(Interaction.id.desc()).first())
+    if hr is None:
+        raise HTTPException(409, "当前没有进行中的连麦")
+    hr.status = "ended"
+    db.commit()
+    return ok({"id": hr.id, "status": "ended"})
 
 
 @router.get("/rooms/{rid}/handraises")
@@ -208,6 +251,16 @@ def list_handraises(rid: int, user: User = Depends(require_roles("teacher")), db
                 "status": r.status} for r in rows])
 
 
+@router.get("/rooms/{rid}/my_handraise")
+def my_handraise(rid: int, user: User = Depends(require_roles("student")), db: Session = Depends(get_db)):
+    room, s = _room_schedule(db, rid)
+    assert_enrolled(db, user, s.course_id)
+    hr = (db.query(Interaction)
+          .filter_by(room_id=rid, student_id=user.id, type="handraise")
+          .order_by(Interaction.id.desc()).first())
+    return ok({"status": hr.status, "handraise_id": hr.id} if hr else {"status": None})
+
+
 @router.post("/rooms/{rid}/handraises/{iid}/handle")
 def handle_handraise(rid: int, iid: int, body: dict,
                      user: User = Depends(require_roles("teacher")), db: Session = Depends(get_db)):
@@ -217,11 +270,29 @@ def handle_handraise(rid: int, iid: int, body: dict,
     if hr is None or hr.type != "handraise" or hr.room_id != rid:
         raise HTTPException(404, "handraise not found")
     action = body.get("action")
-    if action not in ("accept", "decline"):
-        raise HTTPException(422, "action must be accept|decline")
-    hr.status = "accepted" if action == "accept" else "declined"
+    if action not in ("accept", "decline", "end"):
+        raise HTTPException(422, "action must be accept|decline|end")
+    if action == "accept" and hr.status != "waiting":
+        raise HTTPException(409, "该举手已处理")
+    hr.status = {"accept": "accepted", "decline": "declined", "end": "ended"}[action]
     db.commit()
     return ok({"id": iid, "status": hr.status})
+
+
+@router.get("/rooms/{rid}/rollcall/active")
+def active_rollcall(rid: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    room, s = _assert_room_access(user, db, rid)
+    latest = (db.query(Interaction).filter_by(room_id=rid, type="rollcall")
+              .order_by(Interaction.id.desc()).first())
+    if latest is None:
+        return ok(None)
+    rows = db.query(Interaction).filter_by(room_id=rid, type="rollcall", content=latest.content).all()
+    pending = [r for r in rows if r.status == "pending"]
+    if not pending:
+        return ok(None)
+    mine = next((r.status for r in rows if r.student_id == user.id), None)
+    return ok({"batch": latest.content[6:], "called": len(rows),
+               "present": sum(1 for r in rows if r.status == "present"), "mine": mine})
 
 
 @router.post("/rooms/{rid}/rollcall")
@@ -288,7 +359,8 @@ def room_votes(rid: int, user: User = Depends(get_current_user), db: Session = D
             db.commit()
         out.append({"id": v.id, "title": v.title, "options": v.options, "status": v.status,
                     "deadline": v.deadline.isoformat(),
-                    "result": dict(zip(v.options, counts)), "participants": len(records),
+                    "result": [{"option": o, "count": c} for o, c in zip(v.options, counts)],
+                    "participants": len(records),
                     "mine": mine})
     return ok(out)
 
@@ -300,6 +372,8 @@ def create_vote(rid: int, body: dict, user: User = Depends(require_roles("teache
     options = body.get("options", [])
     if len(options) < 2 or len(options) > 6:
         raise HTTPException(422, "vote needs 2-6 options")
+    if len(set(options)) != len(options):
+        raise HTTPException(422, "选项内容不能重复")
     v = Vote(room_id=rid, title=body["title"], options=options,
              deadline=now() + timedelta(seconds=body.get("duration_seconds", 60)))
     db.add(v)
@@ -344,7 +418,8 @@ def vote_result(vid: int, user: User = Depends(get_current_user), db: Session = 
         for i in r.selected:
             counts[i] += 1
     return ok({"title": v.title, "status": v.status,
-               "result": dict(zip(v.options, counts)), "participants": len(records)})
+               "result": [{"option": o, "count": c} for o, c in zip(v.options, counts)],
+               "participants": len(records)})
 
 
 @router.post("/rooms/{rid}/heartbeat")
@@ -370,26 +445,91 @@ def get_recording(sid: int, user: User = Depends(get_current_user), db: Session 
         raise HTTPException(404, "recording not generated")
     mine = db.query(WatchLog).filter_by(student_id=user.id, target_type="replay",
                                         target_id=rec.id).first()
+    c = course_or_404(db, s.course_id)
     return ok({"id": rec.id, "schedule_id": sid, "status": rec.status,
                "duration": rec.duration, "hls_url": rec.hls_url,
+               "error_message": rec.error_message or "",
+               "can_manage": user.role == "admin" or c.teacher_id == user.id,
                "my_seconds": mine.seconds if mine else 0,
                "last_position": mine.last_position if mine else 0})
 
 
-@router.post("/recordings/{rid}/transcode")
-def finish_transcode(rid: int, body: dict, user: User = Depends(require_roles("teacher", "admin")), db: Session = Depends(get_db)):
-    rec = db.get(Recording, rid)
-    if rec is None:
-        raise HTTPException(404, "recording not found")
+@router.get("/recordings/{rid}/hls/{fname}")
+def replay_file(rid: int, fname: str, user: User = Depends(get_current_user),
+                db: Session = Depends(get_db)):
+    """回放切片由后端按选课关系鉴权后发出（SRS 文件服务无鉴权也无 CORS）。"""
+    rec = _recording_or_404(db, rid)
     s = schedule_or_404(db, rec.schedule_id)
-    assert_course_owner(user, course_or_404(db, s.course_id))
-    if rec.status != "transcoding":
-        raise HTTPException(409, f"recording status '{rec.status}'")
-    rec.status = "ready"
-    rec.duration = int(body.get("duration", 0))
-    rec.hls_url = f"/hls/rec_{rec.id}/index.m3u8"
+    assert_enrolled(db, user, s.course_id)
+    if rec.status != "ready":
+        raise HTTPException(409, "replay not ready")
+    if fname != "index.m3u8" and not _SEG_NAME.match(fname):
+        raise HTTPException(400, "invalid file name")
+    path = recording.replay_dir(rid) / fname
+    if not path.is_file():
+        raise HTTPException(404, "file not found")
+    mt = "application/vnd.apple.mpegurl" if fname.endswith(".m3u8") else "video/mp2t"
+    return FileResponse(path, media_type=mt)
+
+
+@router.post("/recordings/{rid}/retranscode")
+def retranscode(rid: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """讲师/管理员重新生成回放（原片仍在，重跑转码）。"""
+    rec = _recording_or_404(db, rid)
+    assert_course_owner(user, course_or_404(db, schedule_or_404(db, rec.schedule_id).course_id))
+    room = db.query(LiveRoom).filter_by(schedule_id=rec.schedule_id).first()
+    if room is None:
+        raise HTTPException(404, "room not found")
+    if room.status == "living":
+        raise HTTPException(409, "live is still running")
+    if not media.dvr_final_file(room.stream_key):
+        raise HTTPException(409, "录制原片已不存在，无法重新生成")
+    shutil.rmtree(recording.replay_dir(rid), ignore_errors=True)
+    rec.status = "transcoding"
+    rec.error_message = ""
     db.commit()
-    return ok({"id": rec.id, "status": "ready", "hls_url": rec.hls_url})
+    recording.spawn(rid, room.stream_key)
+    return ok({"id": rid, "status": rec.status})
+
+
+@router.delete("/recordings/{rid}")
+def delete_recording(rid: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """删除回放：原片 + HLS 产物 + 该回放的观看记录一并清理。"""
+    rec = _recording_or_404(db, rid)
+    assert_course_owner(user, course_or_404(db, schedule_or_404(db, rec.schedule_id).course_id))
+    room = db.query(LiveRoom).filter_by(schedule_id=rec.schedule_id).first()
+    if room is not None and room.status == "living":
+        raise HTTPException(409, "live is still running")
+    if rec.file_path:
+        (media.MEDIA_DIR / rec.file_path).unlink(missing_ok=True)
+    shutil.rmtree(recording.replay_dir(rid), ignore_errors=True)
+    db.query(WatchLog).filter_by(target_type="replay", target_id=rid).delete()
+    db.delete(rec)
+    db.commit()
+    return ok({"id": rid, "deleted": True})
+
+
+@router.get("/recordings/{rid}/download")
+def download_recording(rid: int, user: User = Depends(require_roles("admin")), db: Session = Depends(get_db)):
+    """管理员下载归档录制原片。"""
+    rec = _recording_or_404(db, rid)
+    if not rec.file_path:
+        raise HTTPException(404, "source file not found")
+    path = media.MEDIA_DIR / rec.file_path
+    if not path.is_file():
+        raise HTTPException(404, "source file not found")
+    return FileResponse(path, media_type="video/mp4", filename=f"recording_{rid}.mp4")
+
+
+@router.get("/media/status")
+def media_status(user: User = Depends(get_current_user)):
+    """流媒体与转码依赖自检，供页面提示「为什么看不到画面」。"""
+    return ok({
+        "srs_online": media.media_reachable(),
+        "srs_api": media.SRS_API_URL,
+        "ffmpeg_online": bool(shutil.which(media.FFMPEG_BIN)),
+        "media_dir": str(media.MEDIA_DIR),
+    })
 
 
 @router.put("/recordings/{rid}/heartbeat")

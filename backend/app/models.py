@@ -97,7 +97,7 @@ class Interaction(Base):
     content = Column(Text, default="")
     status = Column(String(16), default="normal")
     # danmaku: normal|recalled ; question: normal|answered
-    # handraise: waiting|accepted|declined ; rollcall: pending|present|absent
+    # handraise: waiting|accepted|declined|ended ; rollcall: pending|present|absent
     ts = Column(DateTime, default=utcnow)
 
 
@@ -125,10 +125,11 @@ class Recording(Base):
     __tablename__ = "recordings"
     id = Column(Integer, primary_key=True)
     schedule_id = Column(ForeignKey("schedules.id"), unique=True, nullable=False)
-    file_path = Column(String(256), default="")
+    file_path = Column(String(256), default="")  # SRS DVR 录制原片（相对 media 目录）
     hls_url = Column(String(256), default="")
     duration = Column(Integer, default=0)  # seconds
     status = Column(String(16), default="transcoding")  # transcoding|ready|failed
+    error_message = Column(String(256), default="")
 
 
 class WatchLog(Base):
@@ -180,6 +181,26 @@ class Question(Base):
     options = Column(JSON, default=list)
     answer = Column(Text, nullable=False)
     score = Column(Integer, default=5)
+
+
+class AssignmentQuestion(Base):
+    __tablename__ = "assignment_questions"
+    __table_args__ = (UniqueConstraint("assignment_id", "question_id"),)
+    id = Column(Integer, primary_key=True)
+    assignment_id = Column(ForeignKey("assignments.id"), nullable=False)
+    question_id = Column(ForeignKey("question_bank.id"), nullable=False)
+    sort = Column(Integer, default=0)
+    question = relationship(Question)
+
+
+class AssignmentAnswer(Base):
+    __tablename__ = "assignment_answers"
+    __table_args__ = (UniqueConstraint("submission_id", "question_id"),)
+    id = Column(Integer, primary_key=True)
+    submission_id = Column(ForeignKey("submissions.id"), nullable=False)
+    question_id = Column(ForeignKey("question_bank.id"), nullable=False)
+    answer = Column(Text, default="")
+    question = relationship(Question)
 
 
 class Exam(Base):

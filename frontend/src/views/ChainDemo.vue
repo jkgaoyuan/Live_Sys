@@ -2,6 +2,7 @@
 import { ref, reactive } from 'vue'
 import axios from 'axios'
 import { auth } from '../store'
+import { whipPublish, syntheticStream } from '../webrtc'
 import { ElMessage } from 'element-plus'
 
 const raw = axios.create({ baseURL: 'http://127.0.0.1:8000/api/v1', timeout: 15000 })
@@ -75,10 +76,13 @@ step('⑤ 排课（含时间冲突校验）', async () => {
   return `schedule #${s.id} planned · 重复排课拒绝:${conflict}`
 })
 
-step('⑥ 开播（生成模拟 SRS 推拉流地址）', async () => {
+step('⑥ 开播（SRS 真实推流，服务端随即自动录制）', async () => {
   const d = await R('post', `/schedules/${ctx.sid}/start`, ctx.tTeacher)
   ctx.rid = d.room_id
-  return `room #${d.room_id} living · push=${d.push_url}`
+  if (!d.media_online) throw new Error('SRS 不可达，请先执行 docker compose up -d srs')
+  ctx.syn = syntheticStream()
+  ctx.sess = await whipPublish(d.push_url, ctx.syn.stream)
+  return `room #${d.room_id} living · whip=${d.push_url} · 信令成功，媒体流已上行`
 })
 
 step('⑦ 弹幕/提问 → 讲师解答与撤回', async () => {
@@ -116,23 +120,35 @@ step('⑪ 心跳计入学习时长（学生A 4次×30s）', async () => {
   return 'watch_logs(live) 累计 120 秒'
 })
 
-step('⑫ 停播 → 自动生成录制 → 停播后心跳拒绝', async () => {
+step('⑫ 持续推流 20 秒后停播 → 服务端录制定稿', async () => {
+  await new Promise((r) => setTimeout(r, 20000))
+  const pushed = ctx.sess.pc.getSenders().reduce((n, s) => n + (s.track ? 1 : 0), 0)
+  await ctx.sess.close()
+  ctx.syn.stop()
   const d = await R('post', `/rooms/${ctx.rid}/stop`, ctx.tTeacher)
   ctx.recid = d.recording_id
   let rejected = false
   try { await R('post', `/rooms/${ctx.rid}/heartbeat`, ctx.tS1, { seconds: 30 }) } catch (e) { rejected = e.response?.status === 409 }
-  return `recording #${d.recording_id} ${d.recording_status} · 停播后心跳拒绝:${rejected}`
+  return `推流 ${pushed} 条轨道已断开 · recording #${d.recording_id} ${d.recording_status} · 停播后心跳拒绝:${rejected}`
 })
 
-step('⑬ 模拟转码完成 → 回放上架', async () => {
-  await R('post', `/recordings/${ctx.recid}/transcode`, ctx.tTeacher, { duration: 3600 })
-  const r = await R('get', `/schedules/${ctx.sid}/recording`, ctx.tS2)
-  return `status=${r.status} hls=${r.hls_url}`
+step('⑬ 等待自动转码 → 回放上架（真实 ffmpeg HLS）', async () => {
+  const deadline = Date.now() + 180000
+  let r
+  for (;;) {
+    r = await R('get', `/schedules/${ctx.sid}/recording`, ctx.tS2)
+    if (r.status !== 'transcoding') break
+    if (Date.now() > deadline) break
+    await new Promise((x) => setTimeout(x, 4000))
+  }
+  if (r.status !== 'ready') throw new Error(`转码未就绪 status=${r.status} ${r.error_message || ''}`)
+  return `status=${r.status} duration=${r.duration}s hls=${r.hls_url}`
 })
 
 step('⑭ 学生B回放（时长+断点续播）', async () => {
-  await R('put', `/recordings/${ctx.recid}/heartbeat`, ctx.tS2, { seconds: 30, position: 600 })
-  const d = await R('put', `/recordings/${ctx.recid}/heartbeat`, ctx.tS2, { seconds: 30, position: 1200 })
+  const p1 = Math.min(5, (await R('get', `/schedules/${ctx.sid}/recording`, ctx.tS2)).duration)
+  await R('put', `/recordings/${ctx.recid}/heartbeat`, ctx.tS2, { seconds: 30, position: p1 })
+  const d = await R('put', `/recordings/${ctx.recid}/heartbeat`, ctx.tS2, { seconds: 30, position: p1 + 5 })
   return `累计 ${d.total_seconds}s · 断点 ${d.last_position}s`
 })
 
@@ -186,6 +202,7 @@ async function run() {
       log.value[i].detail = await steps[i].fn()
       log.value[i].status = 'ok'
     } catch (e) {
+      if (ctx.sess) { await ctx.sess.close().catch(() => {}); ctx.syn?.stop(); ctx.sess = null }
       log.value[i].detail = (e.response && `${e.response.status} ${JSON.stringify(e.response.data).slice(0, 120)}`) || String(e)
       log.value[i].status = 'fail'
       ElMessage.error(`步骤 ${i + 1} 失败，链路中断`)
